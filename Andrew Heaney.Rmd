@@ -1,0 +1,183 @@
+---
+title: "Andrew Heaney Scouting Report"
+author: "Kevin Pate"
+date: "1/31/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+```{r}
+library(baseballr)
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(nnet)
+
+roll_mean = function(df, k=3){
+  out = data.frame(matrix(nrow=nrow(df)-k+1,
+                          ncol=ncol(df)))
+  names(out) = names(df)
+  for(i in k:nrow(df)){
+    temp = df[k:(i-k+1),]
+    tots = colSums(temp, na.rm=T)
+    pct = tots/sum(tots)
+    out[i-k+1,] = pct
+  }
+  return(out)
+}
+```
+
+```{r cars, message=FALSE, warning=FALSE}
+id = playerid_lookup("Heaney", "Andrew")
+
+data = scrape_statcast_savant(start_date = "2020-01-01",
+                              end_date = "2020-12-31",
+                              playerid = id$mlbam_id,
+                              player_type = "pitcher")
+for(yr in 2019:id$mlb_played_first){
+  data = data %>%
+    bind_rows(scrape_statcast_savant(start_date = paste(yr, 
+                                                        "01", "01", sep="-"),
+                                     end_date = paste(yr, 
+                                                        "12", "31", sep="-"),
+                                     playerid = id$mlbam_id,
+                                     player_type="pitcher"))
+}
+```
+
+## Including Plots
+
+```{r pressure, echo=FALSE}
+first_pitch = data %>%
+  map_df(rev) %>%
+  filter(balls==0 & strikes==0) %>%
+  group_by(game_date) %>%
+  count(pitch_type) %>%
+  spread(pitch_type, n) %>%
+  ungroup()
+
+roll_avg = roll_mean(first_pitch %>% select(-c(game_date))) %>%
+  select(-c("null", "IN"))
+roll_avg_lng = roll_avg %>% 
+  mutate(gm = seq(3, nrow(roll_avg)+2, 1)) %>% gather(., pitch, pct, CH:SL)
+
+ggplot(roll_avg_lng) +
+  geom_line(mapping=aes(x=gm, y=pct, color = pitch, 
+                        linetype = pitch)) +
+  theme_classic()
+```
+
+```{r}
+first_pitch_L = data %>%
+  map_df(rev) %>%
+  filter(balls==0 & strikes==0 & stand=="L") %>%
+  group_by(game_date) %>%
+  count(pitch_type) %>%
+  spread(pitch_type, n) %>%
+  ungroup()
+
+first_pitch_R = data %>%
+  map_df(rev) %>%
+  filter(balls==0 & strikes==0 & stand=="R") %>%
+  group_by(game_date) %>%
+  count(pitch_type) %>%
+  spread(pitch_type, n) %>%
+  ungroup()
+
+roll_avg_L = roll_mean(first_pitch_L %>% select(-c(game_date)), k=5) %>%
+  select(-c("null"))
+roll_avg_R = roll_mean(first_pitch_R %>% select(-c(game_date)), k=5) %>%
+  select(-c("null", "IN"))
+roll_avg_LR_lng = roll_avg_L %>% 
+  mutate(gm = seq(5, nrow(roll_avg_L)+4, 1),
+         stand="L") %>% 
+  gather(., pitch, pct, CH:SL) %>%
+  bind_rows(roll_avg_R %>%
+              mutate(gm = seq(5, nrow(roll_avg_R)+4, 1),
+                     stand="R") %>% 
+              gather(., pitch, pct, CH:SL))
+
+ggplot(roll_avg_LR_lng) +
+  geom_line(mapping=aes(x=gm, y=pct, color = pitch, 
+                        linetype = pitch)) +
+  facet_grid(cols=vars(stand)) +
+  theme_classic() +
+  ggtitle("Andrew Heaney first-pitch percentage",
+          subtitle = "R/L splits since 2014 debut")
+```
+
+```{r}
+count_data = data %>%
+  mutate(count = ifelse(balls==strikes, "even",
+                        ifelse(balls>strikes, "behind", "ahead"))) %>%
+  group_by(game_date, count, stand) %>%
+  count(pitch_name) %>%
+  spread(pitch_name, n) %>%
+  select(-c(`Intentional Ball`, null)) %>%
+  ungroup()
+
+avgs = data.frame()
+for(ct in c("ahead", "even", "behind")){
+  for(st in c("L", "R")){
+    avgs = avgs %>%
+      bind_rows(data.frame(roll_mean(count_data %>% 
+                            filter(count==ct & stand==st) %>% 
+                            select(-c(game_date, count, stand)), k=5),
+                           count=ct,
+                           stand=st) %>%
+                  mutate(game=seq(5,(n()+4))))
+  }
+}
+
+avgs_long = avgs %>%
+  gather(., pitch, pct, X4.Seam.Fastball:Slider)
+
+ggplot(avgs_long %>% mutate(pitch=ifelse(pitch=="X4.Seam.Fastball", "4-Seam Fastball",
+                                         pitch))) +
+  geom_line(aes(x=game, y=pct, color=pitch, linetype=pitch)) +
+  facet_grid(rows=vars(stand), cols=vars(count)) +
+  ggtitle("Andrew Heaney pitch usage", subtitle = "L/R splits by count situation")
+```
+
+```{r}
+ggplot(data %>% 
+         filter(!(pitch_type %in% c("null", "IN")))) +
+  geom_point(aes(x=release_pos_x, y=release_pos_z, col=pitch_name)) +
+  facet_grid(rows=vars(game_year)) +
+  ggtitle("Andrew Heaney release point by pitch by season")
+```
+
+```{r}
+model_data = data %>%
+  mutate(count = paste(balls, strikes, sep="-"),
+         bases = paste(ifelse(is.na(on_1b), "X", "1"),
+                       ifelse(is.na(on_2b), "X", "1"),
+                       ifelse(is.na(on_3b), "X", "1"))) %>%
+  filter(!(pitch_type %in% c("null", "IN"))) %>%
+  mutate(pitch_name = ifelse(pitch_name %in% c("Slider", "Curveball"),
+                             "Breaking",
+                             pitch_name)) %>%
+  mutate(pitch_name = ifelse(pitch_name %in% c("4-Seam Fastball", "Sinker"),
+                             "Fastball",
+                             pitch_name))
+
+model=multinom(pitch_name~count*stand+bases+outs_when_up, 
+               data=model_data %>%
+                 filter(game_year < 2019))
+summary(model)
+
+prediction = predict(model, newdata = model_data %>% filter(game_year>=2019))
+(tab=with(model_data%>%filter(game_year>=2019),
+          table(pitch_name, prediction)))
+
+sum(diag(tab))/sum(tab)
+
+#MASS::dropterm(model, trace=FALSE, test="Chisq") 
+```
